@@ -146,6 +146,7 @@ DEFAULTS = {
     'general': {
         # Use Ctrl+Alt as the default base for key combinations
         'ModMask': 'Control Mod1',
+        'MoveModMask': 'Control Shift',
         'UseWorkarea': True,
     },
     'keys': {
@@ -330,6 +331,50 @@ class WindowManager(object):
         self.reposition(win, result, monitorGeom)
         return result
 
+    def moveToLocation(self, location, window = None):
+        """Given a string representation of a screen location, move the window there
+        """
+
+        win, monitorGeom, winGeom, monitorID = self.getGeometries(window)
+
+        # This temporary hack prevents an Exception with MPlayer.
+        if not monitorGeom:
+            return None
+
+        xpos = 0
+        ypos = 1
+        width = 2
+        height = 3
+
+        positions = {
+            'left'           : (0, int((monitorGeom[height] - winGeom[height])/2)),
+            'top-left'       : (0, 0),
+            'bottom-left'    : (0, monitorGeom[height] - winGeom[height]),
+            'right'          : (monitorGeom[width] - winGeom[width], int((monitorGeom[height] - winGeom[height])/2)),
+            'top-right'      : (monitorGeom[width] - winGeom[width], 0),
+            'bottom-right'   : (monitorGeom[width] - winGeom[width], monitorGeom[height] - winGeom[height]),
+            'top'            : (int((monitorGeom[width] - winGeom[width])/2), 0),
+            'bottom'         : (int((monitorGeom[width] - winGeom[width])/2), monitorGeom[height] - winGeom[height]),
+            'middle'         : (int((monitorGeom[width] - winGeom[width])/2), int((monitorGeom[height] - winGeom[height])/2))
+        }
+
+        if location in positions:
+            posx, posy = positions[location]
+
+            logging.debug("Moving window at %s %s to %s %s" % (winGeom[xpos], winGeom[ypos], posx, posy))
+            
+            if posx == winGeom[xpos] and posy == winGeom[ypos]:
+                self.cmd_cycleMonitors()
+            else:
+                dims = (posx, posy, winGeom[width], winGeom[height])
+                result = gtk.gdk.Rectangle(*dims)
+
+                self.reposition(win, result, monitorGeom)
+            return True
+        else:
+            return False
+
+
     def cmd_moveCenter(self, window=None):
         """
         Center the window in the current monitor.
@@ -359,6 +404,19 @@ class WindowManager(object):
         logging.debug("result %r", tuple(result))
         self.reposition(win, result, monitorGeom)
         return result
+
+    def doMoveCommand(self, command):
+        """Resolve a textual move command and execute it.
+
+        @returns: A boolean indicating success/failure.
+        @type command: C{str}
+        @rtype: C{bool}
+        """
+        int_command = self.commands.get(command, None)
+        if isinstance(int_command, (tuple, list)):
+            return self.moveToLocation(command)
+        else:
+            return self.doCommand(command)
 
     def doCommand(self, command):
         """Resolve a textual positioning command and execute it.
@@ -500,11 +558,13 @@ class WindowManager(object):
 class QuickTileApp(object):
     keybinds_failed = False
 
-    def __init__(self, wm, keys=None, modkeys=None):
+    def __init__(self, wm, keys=None, modkeys=None, movemodkeys=None):
         """@todo: document these arguments"""
         self.wm = wm
         self._keys = keys or {}
         self._modkeys = modkeys or 0
+        self._movemodkeys = movemodkeys or 0
+        self._movemodmask = 0
 
     def _init_dbus(self):
         """Setup dbus-python components in the PyGTK event loop"""
@@ -517,6 +577,8 @@ class QuickTileApp(object):
                      in_signature='s', out_signature='b')
             def doCommand(self, command):
                 return wm.doCommand(command)
+            def doMoveCommand(self, command):
+                return wm.doMoveCommand(command)
 
         self.dbusName = dbus.service.BusName("com.ssokolow.QuickTile", sessBus)
         self.dbusObj = QuickTile()
@@ -544,11 +606,14 @@ class QuickTileApp(object):
         try:
             modmask = reduce(operator.ior, [getattr(X, "%sMask" % x)
                              for x in self._modkeys])
+            self._movemodmask = reduce(operator.ior, [getattr(X, "%sMask" % x)
+                             for x in self._movemodkeys])
         except Exception, err:
             logging.error("Error while resolving modifier key mask: %s", err)
             logging.error("Not binding keys for safety reasons. "
                           "(eg. What if Ctrl+C got bound?)")
             modmask = 0
+            movemodmask = 0
         else:
             self.xdisp.set_error_handler(self.handle_xerror)
 
@@ -558,6 +623,8 @@ class QuickTileApp(object):
                 for ignored in powerset([X.Mod2Mask, X.LockMask, X.Mod5Mask]):
                     ignored = reduce(lambda x, y: x | y, ignored, 0)
                     self.xroot.grab_key(keycode, modmask | ignored, 1,
+                                        X.GrabModeAsync, X.GrabModeAsync)
+                    self.xroot.grab_key(keycode, self._movemodmask | ignored, 1,
                                         X.GrabModeAsync, X.GrabModeAsync)
 
         # If we don't do this, then nothing works.
@@ -608,7 +675,13 @@ class QuickTileApp(object):
             if xevent.type == X.KeyPress:
                 keycode = xevent.detail
                 if keycode in self.keys:
-                    self.wm.doCommand(self.keys[keycode])
+
+                    isMove = ((xevent.state & self._movemodmask) == self._movemodmask)
+
+                    if isMove:
+                        self.wm.doMoveCommand(self.keys[keycode])
+                    else:
+                        self.wm.doCommand(self.keys[keycode])
                 else:
                     logging.error("Received an event for an unrecognized "
                                   "keycode: %s" % keycode)
@@ -620,7 +693,8 @@ class QuickTileApp(object):
 
         print "Keybindings defined for use with --daemonize:\n"
 
-        print "Modifier: %s\n" % '+'.join(str(x) for x in self._modkeys)
+        print "Resize Modifier: %s\n" % '+'.join(str(x) for x in self._modkeys)
+        print "Move Modifier: %s\n" % '+'.join(str(x) for x in self._movemodkeys)
 
         print "Key".ljust(maxlen_keys), "Action"
         print "-" * maxlen_keys, "-" * maxlen_vals
@@ -682,6 +756,7 @@ if __name__ == '__main__':
             dirty = True
 
     modkeys = config.get('general', 'ModMask').split()
+    movemodkeys = config.get('general', 'MoveModMask').split()
 
     # Either load the keybindings or use and save the defaults
     if config.has_section('keys'):
@@ -704,7 +779,7 @@ if __name__ == '__main__':
                        or opts.no_workarea)
 
     wm = WindowManager(POSITIONS, ignore_workarea=ignore_workarea)
-    app = QuickTileApp(wm, keymap, modkeys=modkeys)
+    app = QuickTileApp(wm, keymap, modkeys=modkeys, movemodkeys=movemodkeys)
 
     if opts.showBinds:
         app.showBinds()
